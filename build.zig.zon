@@ -1,16 +1,17 @@
 .{
-    .name = "zlz",
+    .name = .zlz,
     .version = "0.1.0",
-    .minimum_zig_version = "0.12.0",
+    .minimum_zig_version = "0.14.0",
 
-    .dependencies = .{
-        // Currently no external dependencies - the LZ decoder uses only Zig std library
-    },
+    .dependencies = .{},
 
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        // Add README, LICENSE, etc. when they exist
+        "README.md",
+        "LICENSE",
     },
+
+    .fingerprint = 0xdfbf881dba5f6146,
 }

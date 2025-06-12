@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const optimize = b.standardOptimizeOption(.{});
 
-    // Create a library target for the LZ decoder
+    // Create a library target for the LZ and GLZ decoders
     const lib = b.addStaticLibrary(.{
         .name = "zlz",
         .root_source_file = b.path("src/lz.zig"),
@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
     // Create an executable target for testing/demo purposes
     const exe = b.addExecutable(.{
         .name = "zlz-demo",
-        .root_source_file = b.path("src/lz.zig"),
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -57,6 +57,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the demo application");
     run_step.dependOn(&run_cmd.step);
 
+    // Create test executable for real frame processing
+    const test_exe = b.addExecutable(.{
+        .name = "test_real_frames",
+        .root_source_file = b.path("src/test_real_frames.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Link against system SDL3
+    test_exe.linkSystemLibrary("SDL3");
+
+    const test_run_cmd = b.addRunArtifact(test_exe);
+    test_run_cmd.step.dependOn(b.getInstallStep());
+
+    const test_frames_step = b.step("test-frames", "Test with real binary frames");
+    test_frames_step.dependOn(&test_run_cmd.step);
+
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const lib_unit_tests = b.addTest(.{
@@ -74,10 +91,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_unit_tests.step);
 
     // Create a module for the library so it can be imported by other projects
-    const lz_module = b.addModule("zlz", .{
-        .root_source_file = b.path("src/lz.zig"),
-        .target = target,
-        .optimize = optimize,
+    _ = b.addModule("zlz", .{
+        .root_source_file = b.path("src/root.zig"),
     });
-    _ = lz_module; // Suppress unused variable warning
 }
