@@ -74,21 +74,59 @@ pub fn build(b: *std.Build) void {
     const test_frames_step = b.step("test-frames", "Test with real binary frames");
     test_frames_step.dependOn(&test_run_cmd.step);
 
-    // Creates a step for unit testing. This only builds the test executable
-    // but does not run it.
+    // Creates comprehensive test steps for all modules
+
+    // Test the main library (LZ and GLZ decoders)
     const lib_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/lz.zig"),
         .target = target,
         .optimize = optimize,
     });
-
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
-    // Similar to creating the run step earlier, this exposes a `test` step to
-    // the `zig build --help` menu, providing a way for the user to request
-    // running the unit tests.
-    const test_step = b.step("test", "Run unit tests");
+    // Test the root library API
+    const root_unit_tests = b.addTest(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_root_unit_tests = b.addRunArtifact(root_unit_tests);
+
+    // Test LZ4 implementation
+    const lz4_unit_tests = b.addTest(.{
+        .root_source_file = b.path("src/test_lz4.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_lz4_unit_tests = b.addRunArtifact(lz4_unit_tests);
+
+    // Test zlib implementation
+    const zlib_unit_tests = b.addTest(.{
+        .root_source_file = b.path("src/test_zlib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_zlib_unit_tests = b.addRunArtifact(zlib_unit_tests);
+
+    // Main test step that runs all tests
+    const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
+    test_step.dependOn(&run_root_unit_tests.step);
+    test_step.dependOn(&run_lz4_unit_tests.step);
+    test_step.dependOn(&run_zlib_unit_tests.step);
+
+    // Individual test steps for granular testing
+    const test_lz_step = b.step("test-lz", "Run LZ/GLZ decoder tests");
+    test_lz_step.dependOn(&run_lib_unit_tests.step);
+
+    const test_root_step = b.step("test-root", "Run root library API tests");
+    test_root_step.dependOn(&run_root_unit_tests.step);
+
+    const test_lz4_step = b.step("test-lz4", "Run LZ4 implementation tests");
+    test_lz4_step.dependOn(&run_lz4_unit_tests.step);
+
+    const test_zlib_step = b.step("test-zlib", "Run zlib implementation tests");
+    test_zlib_step.dependOn(&run_zlib_unit_tests.step);
 
     // Create a module for the library so it can be imported by other projects
     _ = b.addModule("zlz", .{
