@@ -25,9 +25,24 @@ pub const ImageData = lz.ImageData;
 pub const LzImage = lz.LzImage;
 pub const SpicePalette = lz.SpicePalette;
 
+// GLZ types
+pub const SpiceGlzDecoderWindow = glz.SpiceGlzDecoderWindow;
+pub const GlibGlzDecoder = glz.GlibGlzDecoder;
+pub const GlzImage = glz.GlzImage;
+pub const GlzImageHdr = glz.GlzImageHdr;
+
 // Main decompression functions
 pub const lz_rgb32_decompress = lz.lz_rgb32_decompress;
 pub const convertSpiceLzToImageData = lz.convertSpiceLzToImageData;
+
+// GLZ decoder functions and types
+pub const glzDecoderWindowNew = glz.glzDecoderWindowNew;
+pub const glzDecoderWindowClear = glz.glzDecoderWindowClear;
+pub const glzDecoderWindowDestroy = glz.glzDecoderWindowDestroy;
+pub const glzDecoderNew = glz.glzDecoderNew;
+pub const glzDecoderDestroy = glz.glzDecoderDestroy;
+pub const glzDecode = glz.glzDecode;
+pub const glzWindowAddImage = glz.glzWindowAddImage;
 
 // Test functions
 pub const testLzDecompression = lz.testLzDecompression;
