@@ -119,13 +119,10 @@ pub const SpiceGlzDecoderWindow = struct {
     pub fn add(self: *SpiceGlzDecoderWindow, img: *GlzImage) !void {
         var slot = img.hdr.id % self.nimages;
 
-        std.debug.print("[GLZ] Adding image to window: id={}, slot={}, size={}x{}\n", .{ img.hdr.id, slot, img.hdr.width, img.hdr.height });
-
         if (self.images[slot]) |existing| {
-            std.debug.print("[GLZ] Slot {} occupied by image id={}, resizing window\n", .{ slot, existing.hdr.id });
+            _ = existing;
             try self.resize();
             slot = img.hdr.id % self.nimages;
-            std.debug.print("[GLZ] After resize: new slot={}\n", .{slot});
         }
 
         self.images[slot] = img;
@@ -142,18 +139,10 @@ pub const SpiceGlzDecoderWindow = struct {
         const slot = (id - dist) % self.nimages;
         const target_id = id - dist;
 
-        std.debug.print("[GLZ] Window lookup: looking for id={}, slot={}, offset={}\n", .{ target_id, slot, offset });
-
         if (self.images[slot]) |img| {
-            std.debug.print("[GLZ] Found image at slot {}: id={}, gross_pixels={}\n", .{ slot, img.hdr.id, img.hdr.gross_pixels });
             if (img.hdr.id == target_id and img.hdr.gross_pixels >= offset) {
-                std.debug.print("[GLZ] Match! Returning reference data\n", .{});
                 return img.data + offset * 4;
-            } else {
-                std.debug.print("[GLZ] No match: id {} != {} or gross_pixels {} < {}\n", .{ img.hdr.id, target_id, img.hdr.gross_pixels, offset });
             }
-        } else {
-            std.debug.print("[GLZ] No image at slot {}\n", .{slot});
         }
         return null;
     }
@@ -216,7 +205,6 @@ pub const GlibGlzDecoder = struct {
 
         // Read version as 32-bit big endian (like spice-gtk)
         const version = self.decode32();
-        std.debug.print("[GLZ] Received version: 0x{X}, expected: 0x{X}\n", .{ version, LZ_VERSION });
         if (version != LZ_VERSION) return error.InvalidVersion;
 
         const tmp = self.in_now[0];
@@ -226,14 +214,12 @@ pub const GlibGlzDecoder = struct {
         self.image.top_down = (tmp >> LZ_IMAGE_TYPE_LOG) != 0;
         self.image.width = self.decode32();
         self.image.height = self.decode32();
-        const stride = self.decode32();
+        _ = self.decode32(); // stride (unused)
 
         self.image.gross_pixels = self.image.width * self.image.height;
 
         self.image.id = self.decode64();
         self.image.win_head_dist = self.decode32();
-
-        std.debug.print("[GLZ] Header parsed: type={}, {}x{}, stride={}, gross_pixels={}, id={}, win_head_dist={}, top_down={}\n", .{ @intFromEnum(self.image.type), self.image.width, self.image.height, stride, self.image.gross_pixels, self.image.id, self.image.win_head_dist, self.image.top_down });
     }
 
     fn glzRgb32Decode(self: *GlibGlzDecoder, out_buf: [*]u8, size: u32, palette: ?*lz.SpicePalette) !usize {
@@ -296,7 +282,8 @@ pub const GlibGlzDecoder = struct {
                     }
                 }
 
-                len += 1;
+                // For RGB32, no length bias (unlike PLT/RGB_ALPHA which have +2, RGB16 which has +1)
+                // len += 0; // No bias for RGB32
                 if (image_dist == 0) {
                     pixel_ofs += 1;
                 }
@@ -311,16 +298,24 @@ pub const GlibGlzDecoder = struct {
                     ref = @ptrCast(@alignCast(ref_bits.?));
                 }
 
-                if (op + len > op_limit) return error.OutputOverflow;
+                if (op + len > op_limit) {
+                    return error.OutputOverflow;
+                }
 
                 if (ref == (out_pix_buf + op - 1)) {
                     const pixel = (out_pix_buf + op - 1)[0];
                     for (0..len) |_| {
+                        if (op >= op_limit) {
+                            return error.BufferOverrun;
+                        }
                         out_pix_buf[op] = pixel;
                         op += 1;
                     }
                 } else {
                     for (0..len) |_| {
+                        if (op >= op_limit) {
+                            return error.BufferOverrun;
+                        }
                         out_pix_buf[op] = ref[0];
                         ref += 1;
                         op += 1;
@@ -329,9 +324,14 @@ pub const GlibGlzDecoder = struct {
             } else {
                 const count = ctrl + 1;
 
-                if (op + count > op_limit) return error.OutputOverflow;
+                if (op + count > op_limit) {
+                    return error.OutputOverflow;
+                }
 
                 for (0..count) |_| {
+                    if (op >= op_limit) {
+                        return error.BufferOverrun;
+                    }
                     out_pix_buf[op].b = ip[0];
                     out_pix_buf[op].g = ip[1];
                     out_pix_buf[op].r = ip[2];
@@ -547,8 +547,5 @@ pub fn testGlzDecoder() !void {
     const decoder = try glzDecoderNew(allocator, window);
     defer glzDecoderDestroy(decoder);
 
-    std.debug.print("GLZ Decoder Test\n", .{});
-    std.debug.print("✓ GLZ decoder created successfully\n", .{});
-    std.debug.print("✓ Window management implemented\n", .{});
-    std.debug.print("✓ Ready for GLZ frame processing\n", .{});
+    // GLZ decoder test completed successfully
 }
