@@ -1,5 +1,6 @@
 const std = @import("std");
 const lz = @import("lz.zig");
+const log = @import("logger").new(.{ .tag = "glz_img" });
 
 // GLZ Constants from spice protocol
 const LZ_MAGIC: u32 = 0x20205a4c; // "  ZL" when read in big endian format (space space Z L)
@@ -57,6 +58,7 @@ pub const GlzImage = struct {
         }
 
         const img = try allocator.create(GlzImage);
+        log.dbg("++ create GlzImage id={} addr=0x{x}", .{ hdr.id, @intFromPtr(img) });
         img.allocator = allocator;
         img.hdr = hdr.*;
 
@@ -75,6 +77,7 @@ pub const GlzImage = struct {
     }
 
     pub fn destroy(self: *GlzImage) void {
+        log.dbg("-- destroy GlzImage id={} addr=0x{x}", .{ self.hdr.id, @intFromPtr(self) });
         self.allocator.free(self.data_slice);
         self.allocator.destroy(self);
     }
@@ -119,10 +122,20 @@ pub const SpiceGlzDecoderWindow = struct {
     pub fn add(self: *SpiceGlzDecoderWindow, img: *GlzImage) !void {
         var slot = img.hdr.id % self.nimages;
 
-        if (self.images[slot]) |existing| {
-            _ = existing;
+        // If the slot is already occupied, first try to grow the window so that
+        // both images can coexist.  After a resize the slot might still be
+        // occupied (same hash / same id).  In that case we explicitly destroy
+        // the old image before overwriting to avoid leaking it.
+        if (self.images[slot]) |_| {
             try self.resize();
             slot = img.hdr.id % self.nimages;
+
+            if (self.images[slot]) |existing_after_resize| {
+                // Same image-id (or hash collision) still occupies the final
+                // slot – we drop the previous entry to prevent a memory leak.
+                existing_after_resize.destroy();
+                self.images[slot] = null;
+            }
         }
 
         self.images[slot] = img;

@@ -3,7 +3,12 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.14.0",
 
-    .dependencies = .{},
+    .dependencies = .{
+        .logger = .{
+            .url = "git+https://github.com/tallenh/logger.zig.git#9300687a79dbadab707739dd8558ca92a7cb7cbc",
+            .hash = "logger-0.4.1-v3VfR0UjAQDAF6Umd3sY90R9u0QHIxG_-D51Bn-E4RNk",
+        },
+    },
 
     .paths = .{
         "build.zig",

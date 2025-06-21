@@ -18,6 +18,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const logger = b.dependency("logger", .{ .target = target, .optimize = optimize });
+    const logger_mod = logger.module("logger");
+    lib.root_module.addImport("logger", logger_mod);
+
+    // Helper to inject the logger dependency into build steps that expose a
+    // root_module field (executables, tests, etc.).
+    const addLoggerImport = struct {
+        fn apply(step: anytype, logger_mod_param: anytype) void {
+            @field(step, "root_module").addImport("logger", logger_mod_param);
+        }
+    };
+
     // This declares intent for the library to be installed-to and run-from
     // within the package installation directory (lib folder)
     b.installArtifact(lib);
@@ -128,8 +140,23 @@ pub fn build(b: *std.Build) void {
     const test_zlib_step = b.step("test-zlib", "Run zlib implementation tests");
     test_zlib_step.dependOn(&run_zlib_unit_tests.step);
 
-    // Create a module for the library so it can be imported by other projects
-    _ = b.addModule("zlz", .{
+    // Executable demo
+    addLoggerImport.apply(exe, logger_mod);
+
+    // Test executables
+    addLoggerImport.apply(test_exe, logger_mod);
+
+    addLoggerImport.apply(lib_unit_tests, logger_mod);
+    addLoggerImport.apply(root_unit_tests, logger_mod);
+    addLoggerImport.apply(lz4_unit_tests, logger_mod);
+    addLoggerImport.apply(zlib_unit_tests, logger_mod);
+
+    // Root module that other projects import.
+    const zlz_module = b.addModule("zlz", .{
         .root_source_file = b.path("src/root.zig"),
     });
+    zlz_module.addImport("logger", logger_mod);
+
+    // If more steps are added later that need logger, remember to call
+    // addLoggerImport.apply on them.
 }
