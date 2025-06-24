@@ -49,6 +49,7 @@ pub const GlzImage = struct {
     data: [*]u8,
     data_slice: []u8, // Keep track of the original slice for freeing
     allocator: std.mem.Allocator,
+    owns_buffer: bool, // Whether this image owns its data buffer
 
     pub fn create(allocator: std.mem.Allocator, hdr: *const GlzImageHdr, image_type: lz.LzImageType, user_data: ?*anyopaque) !*GlzImage {
         _ = user_data;
@@ -61,6 +62,7 @@ pub const GlzImage = struct {
         log.dbg("++ create GlzImage id={} addr=0x{x}", .{ hdr.id, @intFromPtr(img) });
         img.allocator = allocator;
         img.hdr = hdr.*;
+        img.owns_buffer = true; // We allocated the buffer
 
         const data_size = hdr.gross_pixels * 4;
         const data_slice = try allocator.alloc(u8, data_size);
@@ -76,9 +78,44 @@ pub const GlzImage = struct {
         return img;
     }
 
+    /// Create GlzImage that references existing buffer (for zero-copy operations)
+    pub fn createFromExistingBuffer(allocator: std.mem.Allocator, hdr: *const GlzImageHdr, image_type: lz.LzImageType, existing_buffer: []u8, user_data: ?*anyopaque) !*GlzImage {
+        _ = user_data;
+
+        if (image_type != .rgb32 and image_type != .rgba) {
+            return error.InvalidImageType;
+        }
+
+        const expected_size = hdr.gross_pixels * 4;
+        if (existing_buffer.len < expected_size) {
+            return error.BufferTooSmall;
+        }
+
+        const img = try allocator.create(GlzImage);
+        log.dbg("++ create GlzImage (zero-copy) id={} addr=0x{x}", .{ hdr.id, @intFromPtr(img) });
+        img.allocator = allocator;
+        img.hdr = hdr.*;
+        img.owns_buffer = false; // We don't own the buffer (zero-copy)
+
+        // Reference the existing buffer instead of allocating new one
+        img.data_slice = existing_buffer[0..expected_size];
+        img.data = img.data_slice.ptr;
+        img.surface = null;
+
+        if (!img.hdr.top_down) {
+            const row_bytes = img.hdr.width * 4;
+            img.data = img.data + (img.hdr.height - 1) * row_bytes;
+        }
+
+        return img;
+    }
+
     pub fn destroy(self: *GlzImage) void {
-        log.dbg("-- destroy GlzImage id={} addr=0x{x}", .{ self.hdr.id, @intFromPtr(self) });
-        self.allocator.free(self.data_slice);
+        log.dbg("-- destroy GlzImage id={} addr=0x{x} owns_buffer={}", .{ self.hdr.id, @intFromPtr(self), self.owns_buffer });
+        // Only free data_slice if we own it (not for zero-copy buffers)
+        if (self.owns_buffer) {
+            self.allocator.free(self.data_slice);
+        }
         self.allocator.destroy(self);
     }
 };
@@ -539,6 +576,80 @@ pub fn glzDecoderNew(allocator: std.mem.Allocator, w: *SpiceGlzDecoderWindow) !*
 
 pub fn glzDecoderDestroy(d: *GlibGlzDecoder) void {
     d.destroy();
+}
+
+/// Zero-copy GLZ decode to pre-allocated buffer (optimized for Metal shared buffers)
+pub fn glzDecodeToBuffer(decoder: *GlibGlzDecoder, data: []const u8, output_buffer: []u8, palette: ?*lz.SpicePalette, usr_data: ?*anyopaque) !bool {
+    decoder.in_start = data.ptr;
+    decoder.in_now = data.ptr;
+
+    decoder.decodeHeader() catch {
+        std.debug.print("glzDecodeToBuffer: header decode failed\n", .{});
+        return false;
+    };
+
+    const expected_size = decoder.image.gross_pixels * 4; // Assuming RGBA/RGB32 format
+    if (output_buffer.len < expected_size) {
+        std.debug.print("glzDecodeToBuffer: buffer too small: {} < {}\n", .{ output_buffer.len, expected_size });
+        return false;
+    }
+
+    // Decode directly to the provided buffer instead of creating GlzImage
+    const n_in_bytes_decoded = decoder.glzRgb32Decode(@ptrCast(output_buffer.ptr), decoder.image.gross_pixels, palette) catch {
+        std.debug.print("glzDecodeToBuffer: RGB decode failed\n", .{});
+        return false;
+    };
+    decoder.in_now += n_in_bytes_decoded;
+
+    if (decoder.image.type == .rgba) {
+        _ = decoder.glzRgbAlphaDecode(@ptrCast(output_buffer.ptr), decoder.image.gross_pixels, palette) catch {
+            std.debug.print("glzDecodeToBuffer: alpha decode failed\n", .{});
+            return false;
+        };
+    }
+
+    // Smart copy-on-reference strategy:
+    // - If this frame might be referenced by future frames (win_head_dist > 0), create a copy for the window
+    // - Otherwise, use zero-copy reference to shared buffer
+    const decoded_type = if (decoder.image.type == .rgba) lz.LzImageType.rgba else lz.LzImageType.rgb32;
+
+    const window_image = window_image_blk: {
+        if (decoder.image.win_head_dist > 0) {
+            // This frame will be referenced - create a copy for stable window storage
+            const copied_image = GlzImage.create(decoder.allocator, &decoder.image, decoded_type, usr_data) catch {
+                std.debug.print("glzDecodeToBuffer: failed to create copied window entry\n", .{});
+                return false;
+            };
+            // Copy the decoded data to the window's stable storage
+            @memcpy(copied_image.data_slice, output_buffer[0..expected_size]);
+            // std.debug.print("GLZ: Created copy for window (will be referenced, win_head_dist={})\n", .{decoder.image.win_head_dist});
+            break :window_image_blk copied_image;
+        } else {
+            // This frame won't be referenced - use zero-copy reference to shared buffer
+            const zero_copy_image = GlzImage.createFromExistingBuffer(decoder.allocator, &decoder.image, decoded_type, output_buffer[0..expected_size], usr_data) catch {
+                std.debug.print("glzDecodeToBuffer: failed to create zero-copy window entry\n", .{});
+                return false;
+            };
+            // std.debug.print("GLZ: Using zero-copy reference (not referenced, win_head_dist={})\n", .{decoder.image.win_head_dist});
+            break :window_image_blk zero_copy_image;
+        }
+    };
+
+    decoder.window.add(window_image) catch {
+        window_image.destroy();
+        std.debug.print("glzDecodeToBuffer: failed to add to window\n", .{});
+        return false;
+    };
+
+    if (decoder.window.tail_gap > 0) {
+        const image = decoder.window.images[(decoder.window.tail_gap - 1) % decoder.window.nimages];
+        if (image) |img| {
+            const oldest = img.hdr.id - img.hdr.win_head_dist;
+            decoder.window.release(oldest);
+        }
+    }
+
+    return true;
 }
 
 pub fn glzDecode(decoder: *GlibGlzDecoder, data: []const u8, palette: ?*lz.SpicePalette, usr_data: ?*anyopaque) !void {

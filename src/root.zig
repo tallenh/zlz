@@ -41,6 +41,7 @@ pub const GlzImageHdr = glz.GlzImageHdr;
 
 // Main decompression functions
 pub const lz_rgb32_decompress = lz.lz_rgb32_decompress;
+pub const lz_rgb32_decompress_to_buffer = lz.lz_rgb32_decompress_to_buffer; // Zero-copy version
 pub const convertSpiceLzToImageData = lz.convertSpiceLzToImageData;
 
 // GLZ decoder functions and types
@@ -50,6 +51,7 @@ pub const glzDecoderWindowDestroy = glz.glzDecoderWindowDestroy;
 pub const glzDecoderNew = glz.glzDecoderNew;
 pub const glzDecoderDestroy = glz.glzDecoderDestroy;
 pub const glzDecode = glz.glzDecode;
+pub const glzDecodeToBuffer = glz.glzDecodeToBuffer; // Zero-copy version
 pub const glzWindowAddImage = glz.glzWindowAddImage;
 
 // LZ4 types and functions

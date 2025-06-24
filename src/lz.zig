@@ -224,6 +224,64 @@ pub fn convertSpiceLzToImageData(allocator: std.mem.Allocator, lz_image: LzImage
     return result;
 }
 
+/// Zero-copy LZ decompression to pre-allocated buffer (optimized for Metal shared buffers)
+pub fn lz_rgb32_decompress_to_buffer(
+    width: u32,
+    height: u32,
+    in_buf: []const u8,
+    output_buffer: []u8,
+    image_type: LzImageType,
+    top_down: bool,
+    palette: ?*SpicePalette,
+) !bool {
+    _ = palette; // Palette currently unused for RGB formats
+
+    const expected_size = width * height * BYTES_PER_PIXEL;
+    if (output_buffer.len < expected_size) {
+        std.debug.print("lz_rgb32_decompress_to_buffer: buffer too small: {} < {}\n", .{output_buffer.len, expected_size});
+        return false;
+    }
+
+    // Decompress directly to the provided buffer
+    _ = lzRgb32Decompress(in_buf, 0, output_buffer[0..expected_size], image_type, true) catch {
+        std.debug.print("lz_rgb32_decompress_to_buffer: decompression failed\n", .{});
+        return false;
+    };
+
+    if (!top_down) {
+        // Flip image data in-place for bottom-up images
+        flipImageDataInPlace(output_buffer[0..expected_size], width, height) catch {
+            std.debug.print("lz_rgb32_decompress_to_buffer: flip failed\n", .{});
+            return false;
+        };
+    }
+
+    return true;
+}
+
+// Helper function to flip image data in-place (for zero-copy path)
+fn flipImageDataInPlace(data: []u8, width: u32, height: u32) !void {
+    const row_size = width * BYTES_PER_PIXEL;
+    const temp_row = try std.heap.page_allocator.alloc(u8, row_size);
+    defer std.heap.page_allocator.free(temp_row);
+    
+    var top_row: u32 = 0;
+    var bottom_row = height - 1;
+    
+    while (top_row < bottom_row) {
+        const top_start = top_row * row_size;
+        const bottom_start = bottom_row * row_size;
+        
+        // Swap rows using temporary buffer
+        @memcpy(temp_row, data[top_start..top_start + row_size]);
+        @memcpy(data[top_start..top_start + row_size], data[bottom_start..bottom_start + row_size]);
+        @memcpy(data[bottom_start..bottom_start + row_size], temp_row);
+        
+        top_row += 1;
+        bottom_row -= 1;
+    }
+}
+
 // Main decompression function for LZ-RGB images
 pub fn lz_rgb32_decompress(
     allocator: std.mem.Allocator,
