@@ -53,9 +53,16 @@ pub const SpicePalette = struct {
 //  Adapted from lz.c .
 //--------------------------------------------------------------------------
 
-const BYTES_PER_PIXEL = 4;
+const build_options = @import("build_options");
+const ENABLE_SIMD = build_options.simd;
 
-fn lzRgb32Decompress(in_buf: []const u8, start_at: usize, out_buf: []u8, image_type: LzImageType, default_alpha: bool) !usize {
+const BYTES_PER_PIXEL: usize = 4;
+const BPP_SHIFT: u5 = 2;
+inline fn pix2byte(pix: usize) usize {
+    return pix << BPP_SHIFT;
+}
+
+inline fn lzRgb32Decompress(in_buf: []const u8, start_at: usize, out_buf: []u8, image_type: LzImageType, default_alpha: bool) !usize {
     if (start_at >= in_buf.len) return LzError.CorruptedData;
 
     var encoder: usize = start_at;
@@ -63,7 +70,7 @@ fn lzRgb32Decompress(in_buf: []const u8, start_at: usize, out_buf: []u8, image_t
     var ctrl: u8 = in_buf[encoder];
     encoder += 1;
 
-    while ((op * BYTES_PER_PIXEL) < out_buf.len and encoder < in_buf.len) {
+    while (pix2byte(op) < out_buf.len and encoder < in_buf.len) {
         const ref: usize = op;
         var len: u32 = ctrl >> 5;
         var ofs: u32 = (@as(u32, ctrl) & 31) << 8;
@@ -112,33 +119,87 @@ fn lzRgb32Decompress(in_buf: []const u8, start_at: usize, out_buf: []u8, image_t
             // Handle literal data
             const count = ctrl + 1;
 
-            for (0..count) |_| {
-                if ((op * BYTES_PER_PIXEL) >= out_buf.len) break;
+            // fast path for long literal runs in non-RGBA images
+            if (ENABLE_SIMD and image_type != .rgba and count >= 12 and
+                encoder + (count * 3) <= in_buf.len and
+                (pix2byte(op) + (count * BYTES_PER_PIXEL)) <= out_buf.len)
+            {
+                var e_idx = encoder;
+                var d_idx = pix2byte(op);
+                var remaining: usize = count;
+                const alpha_value: u8 = if (default_alpha) 255 else 0;
 
-                switch (image_type) {
-                    .rgba => {
-                        if (encoder >= in_buf.len) return LzError.CorruptedData;
-                        if ((op * BYTES_PER_PIXEL) + 3 < out_buf.len) {
-                            out_buf[(op * BYTES_PER_PIXEL) + 3] = in_buf[encoder];
-                        }
-                        encoder += 1;
-                    },
-                    else => {
-                        if (encoder + 2 >= in_buf.len) return LzError.CorruptedData;
-                        if ((op * BYTES_PER_PIXEL) + 3 < out_buf.len) {
-                            // Keep BGR order for BGRA output (Apple Metal compatible)
-                            out_buf[(op * BYTES_PER_PIXEL) + 0] = in_buf[encoder + 0]; // B
-                            out_buf[(op * BYTES_PER_PIXEL) + 1] = in_buf[encoder + 1]; // G
-                            out_buf[(op * BYTES_PER_PIXEL) + 2] = in_buf[encoder + 2]; // R
-                            if (default_alpha) {
-                                out_buf[(op * BYTES_PER_PIXEL) + 3] = 255; // A
-                            }
-                        }
-                        encoder += 3;
-                    },
+                // Process 8 pixels per iteration for better throughput
+                while (remaining >= 8 and e_idx + 24 <= in_buf.len and d_idx + 32 <= out_buf.len) : (remaining -= 8) {
+                    // Convert 8 BGR pixels to BGRA pixels
+                    comptime var i: usize = 0;
+                    inline while (i < 8) : (i += 1) {
+                        out_buf[d_idx + i*4 + 0] = in_buf[e_idx + i*3 + 0]; // B
+                        out_buf[d_idx + i*4 + 1] = in_buf[e_idx + i*3 + 1]; // G
+                        out_buf[d_idx + i*4 + 2] = in_buf[e_idx + i*3 + 2]; // R
+                        out_buf[d_idx + i*4 + 3] = alpha_value;             // A
+                    }
+                    e_idx += 24; // 8 pixels * 3 bytes
+                    d_idx += 32; // 8 pixels * 4 bytes
                 }
-                op += 1;
+
+                // Process 4 pixels per iteration for remaining
+                while (remaining >= 4 and e_idx + 12 <= in_buf.len and d_idx + 16 <= out_buf.len) : (remaining -= 4) {
+                    comptime var i: usize = 0;
+                    inline while (i < 4) : (i += 1) {
+                        out_buf[d_idx + i*4 + 0] = in_buf[e_idx + i*3 + 0]; // B
+                        out_buf[d_idx + i*4 + 1] = in_buf[e_idx + i*3 + 1]; // G
+                        out_buf[d_idx + i*4 + 2] = in_buf[e_idx + i*3 + 2]; // R
+                        out_buf[d_idx + i*4 + 3] = alpha_value;             // A
+                    }
+                    e_idx += 12;
+                    d_idx += 16;
+                }
+
+                // scalar tail for remaining pixels
+                for (0..remaining) |_| {
+                    out_buf[d_idx + 0] = in_buf[e_idx + 0];
+                    out_buf[d_idx + 1] = in_buf[e_idx + 1];
+                    out_buf[d_idx + 2] = in_buf[e_idx + 2];
+                    out_buf[d_idx + 3] = alpha_value;
+                    e_idx += 3;
+                    d_idx += BYTES_PER_PIXEL;
+                }
+
+                encoder = e_idx;
+                op += count;
+            } else {
+                // Hoist bounds checking outside the loop
+                const end_pixel = op + count;
+                const end_byte = pix2byte(end_pixel);
+                if (end_byte > out_buf.len) return LzError.CorruptedData;
+                
+                // Check input buffer bounds once
+                const input_bytes_needed = if (image_type == .rgba) count else count * 3;
+                if (encoder + input_bytes_needed > in_buf.len) return LzError.CorruptedData;
+                
+                // Now process without bounds checking in inner loop
+                for (0..count) |_| {
+                    const pixel_byte_offset = pix2byte(op);
+                    
+                    switch (image_type) {
+                        .rgba => {
+                            out_buf[pixel_byte_offset + 3] = in_buf[encoder];
+                            encoder += 1;
+                        },
+                        else => {
+                            // Keep BGR order for BGRA output (Apple Metal compatible)
+                            out_buf[pixel_byte_offset + 0] = in_buf[encoder + 0]; // B
+                            out_buf[pixel_byte_offset + 1] = in_buf[encoder + 1]; // G
+                            out_buf[pixel_byte_offset + 2] = in_buf[encoder + 2]; // R
+                            out_buf[pixel_byte_offset + 3] = if (default_alpha) 255 else 0; // A
+                            encoder += 3;
+                        },
+                    }
+                    op += 1;
+                }
             }
+            // end literal handling
         }
 
         if (encoder >= in_buf.len) break;
@@ -149,79 +210,80 @@ fn lzRgb32Decompress(in_buf: []const u8, start_at: usize, out_buf: []u8, image_t
     return if (encoder > 0) encoder - 1 else 0;
 }
 
-fn copyPixels(out_buf: []u8, dest_pixel: usize, src_pixel: usize, pixel_count: u32, image_type: LzImageType) !void {
+inline fn copyPixels(out_buf: []u8, dest_pixel: usize, src_pixel: usize, pixel_count: u32, image_type: LzImageType) !void {
+    // Early bounds check to avoid checking in every iteration
+    const dest_end = pix2byte(dest_pixel + pixel_count);
+    const src_end = pix2byte(src_pixel + pixel_count);
+    if (dest_end > out_buf.len or src_end > out_buf.len) return;
+    
     if (src_pixel == (dest_pixel - 1)) {
         // Run-length encoding: copy from single source pixel
-        const src_offset = src_pixel * BYTES_PER_PIXEL;
-        for (0..pixel_count) |i| {
-            const dest_offset = (dest_pixel + i) * BYTES_PER_PIXEL;
-            if (dest_offset + 3 >= out_buf.len or src_offset + 3 >= out_buf.len) break;
-
-            switch (image_type) {
-                .rgba => {
-                    out_buf[dest_offset + 3] = out_buf[src_offset + 3];
-                },
-                else => {
-                    @memcpy(out_buf[dest_offset .. dest_offset + BYTES_PER_PIXEL], out_buf[src_offset .. src_offset + BYTES_PER_PIXEL]);
-                },
-            }
+        const src_offset = pix2byte(src_pixel);
+        switch (image_type) {
+            .rgba => {
+                // For RGBA, only copy alpha channel
+                const alpha_value = out_buf[src_offset + 3];
+                for (0..pixel_count) |i| {
+                    const dest_offset = pix2byte(dest_pixel + i);
+                    out_buf[dest_offset + 3] = alpha_value;
+                }
+            },
+            else => {
+                // For RGB32, copy entire pixel repeatedly
+                for (0..pixel_count) |i| {
+                    const dest_offset = pix2byte(dest_pixel + i);
+                    @memcpy(out_buf[dest_offset .. dest_offset + BYTES_PER_PIXEL], 
+                           out_buf[src_offset .. src_offset + BYTES_PER_PIXEL]);
+                }
+            },
         }
     } else {
         // Copy from consecutive source pixels
-        for (0..pixel_count) |i| {
-            const dest_offset = (dest_pixel + i) * BYTES_PER_PIXEL;
-            const src_offset = (src_pixel + i) * BYTES_PER_PIXEL;
-            if (dest_offset + 3 >= out_buf.len or src_offset + 3 >= out_buf.len) break;
-
-            switch (image_type) {
-                .rgba => {
+        switch (image_type) {
+            .rgba => {
+                // For RGBA, only copy alpha channels
+                for (0..pixel_count) |i| {
+                    const dest_offset = pix2byte(dest_pixel + i);
+                    const src_offset = pix2byte(src_pixel + i);
                     out_buf[dest_offset + 3] = out_buf[src_offset + 3];
-                },
-                else => {
-                    @memcpy(out_buf[dest_offset .. dest_offset + BYTES_PER_PIXEL], out_buf[src_offset .. src_offset + BYTES_PER_PIXEL]);
-                },
-            }
+                }
+            },
+            else => {
+                // For RGB32, copy pixels one by one (safer than bulk copy due to potential aliasing)
+                for (0..pixel_count) |i| {
+                    const dest_offset = pix2byte(dest_pixel + i);
+                    const src_offset = pix2byte(src_pixel + i);
+                    @memcpy(out_buf[dest_offset .. dest_offset + BYTES_PER_PIXEL], 
+                           out_buf[src_offset .. src_offset + BYTES_PER_PIXEL]);
+                }
+            },
         }
     }
 }
 
 fn flipImageData(allocator: std.mem.Allocator, img: *ImageData) !void {
-    const row_bytes = img.width * BYTES_PER_PIXEL;
-    const temp_buffer = try allocator.alloc(u8, img.data.len);
-    defer allocator.free(temp_buffer);
+    const row_bytes = img.width << BPP_SHIFT;
+    const scratch = try allocator.alloc(u8, row_bytes);
+    defer allocator.free(scratch);
 
-    // Copy rows in reverse order
-    for (0..img.height) |row| {
-        const src_start = row * row_bytes;
-        const src_end = src_start + row_bytes;
-        const dest_start = (img.height - 1 - row) * row_bytes;
+    var top: usize = 0;
+    var bottom: usize = img.height - 1;
+    while (top < bottom) {
+        const top_off = top * row_bytes;
+        const bot_off = bottom * row_bytes;
 
-        if (src_end <= img.data.len and dest_start + row_bytes <= temp_buffer.len) {
-            @memcpy(temp_buffer[dest_start .. dest_start + row_bytes], img.data[src_start..src_end]);
-        }
+        // swap rows via scratch buffer
+        @memcpy(scratch, img.data[top_off .. top_off + row_bytes]);
+        @memcpy(img.data[top_off .. top_off + row_bytes], img.data[bot_off .. bot_off + row_bytes]);
+        @memcpy(img.data[bot_off .. bot_off + row_bytes], scratch);
+        top += 1;
+        bottom -= 1;
     }
-
-    @memcpy(img.data, temp_buffer);
 }
 
+/// Deprecated – use lz_rgb32_decompress instead.
 pub fn convertSpiceLzToImageData(allocator: std.mem.Allocator, lz_image: LzImage) !ImageData {
-    const data_size = lz_image.width * lz_image.height * BYTES_PER_PIXEL;
-    const image_data = try allocator.alloc(u8, data_size);
-    errdefer allocator.free(image_data);
-
-    var result = ImageData{
-        .data = image_data,
-        .width = lz_image.width,
-        .height = lz_image.height,
-    };
-
-    _ = try lzRgb32Decompress(lz_image.data, 0, result.data, lz_image.type, true);
-
-    if (!lz_image.top_down) {
-        try flipImageData(allocator, &result);
-    }
-
-    return result;
+    return lz_rgb32_decompress(allocator, lz_image.width, lz_image.height, lz_image.data, lz_image.type, lz_image.top_down, null);
 }
 
 /// Zero-copy LZ decompression to pre-allocated buffer (optimized for Metal shared buffers)
@@ -236,22 +298,21 @@ pub fn lz_rgb32_decompress_to_buffer(
 ) !bool {
     _ = palette; // Palette currently unused for RGB formats
 
-    const expected_size = width * height * BYTES_PER_PIXEL;
+    const expected_size = width * height << BPP_SHIFT;
     if (output_buffer.len < expected_size) {
-        std.debug.print("lz_rgb32_decompress_to_buffer: buffer too small: {} < {}\n", .{output_buffer.len, expected_size});
         return false;
     }
 
     // Decompress directly to the provided buffer
-    _ = lzRgb32Decompress(in_buf, 0, output_buffer[0..expected_size], image_type, true) catch {
-        std.debug.print("lz_rgb32_decompress_to_buffer: decompression failed\n", .{});
+    // For RGB32, don't set default alpha (it should be 0)
+    const default_alpha = image_type != .rgb32;
+    _ = lzRgb32Decompress(in_buf, 0, output_buffer[0..expected_size], image_type, default_alpha) catch {
         return false;
     };
 
     if (!top_down) {
         // Flip image data in-place for bottom-up images
         flipImageDataInPlace(output_buffer[0..expected_size], width, height) catch {
-            std.debug.print("lz_rgb32_decompress_to_buffer: flip failed\n", .{});
             return false;
         };
     }
@@ -261,22 +322,22 @@ pub fn lz_rgb32_decompress_to_buffer(
 
 // Helper function to flip image data in-place (for zero-copy path)
 fn flipImageDataInPlace(data: []u8, width: u32, height: u32) !void {
-    const row_size = width * BYTES_PER_PIXEL;
+    const row_size = width << BPP_SHIFT;
     const temp_row = try std.heap.page_allocator.alloc(u8, row_size);
     defer std.heap.page_allocator.free(temp_row);
-    
+
     var top_row: u32 = 0;
     var bottom_row = height - 1;
-    
+
     while (top_row < bottom_row) {
         const top_start = top_row * row_size;
         const bottom_start = bottom_row * row_size;
-        
+
         // Swap rows using temporary buffer
-        @memcpy(temp_row, data[top_start..top_start + row_size]);
-        @memcpy(data[top_start..top_start + row_size], data[bottom_start..bottom_start + row_size]);
-        @memcpy(data[bottom_start..bottom_start + row_size], temp_row);
-        
+        @memcpy(temp_row, data[top_start .. top_start + row_size]);
+        @memcpy(data[top_start .. top_start + row_size], data[bottom_start .. bottom_start + row_size]);
+        @memcpy(data[bottom_start .. bottom_start + row_size], temp_row);
+
         top_row += 1;
         bottom_row -= 1;
     }
@@ -294,7 +355,7 @@ pub fn lz_rgb32_decompress(
 ) !ImageData {
     _ = palette; // Palette currently unused for RGB formats
 
-    const data_size = width * height * BYTES_PER_PIXEL;
+    const data_size = width * height << BPP_SHIFT;
     const image_data = try allocator.alloc(u8, data_size);
     errdefer allocator.free(image_data);
 

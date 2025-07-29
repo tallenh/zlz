@@ -2,6 +2,9 @@ const std = @import("std");
 const lz = @import("lz.zig");
 const log = @import("logger").new(.{ .tag = "glz_img" });
 
+const build_options = @import("build_options");
+const ENABLE_SIMD = build_options.simd;
+
 // GLZ Constants from spice protocol
 const LZ_MAGIC: u32 = 0x20205a4c; // "  ZL" when read in big endian format (space space Z L)
 const LZ_VERSION: u32 = 0x00010001; // GLZ version format: 0x00010001 (big endian reading of 00 01 00 01)
@@ -185,7 +188,7 @@ pub const SpiceGlzDecoderWindow = struct {
         }
     }
 
-    fn bits(self: *SpiceGlzDecoderWindow, id: u64, dist: u32, offset: u32) ?[*]u8 {
+    inline fn bits(self: *SpiceGlzDecoderWindow, id: u64, dist: u32, offset: u32) ?[*]u8 {
         const slot = (id - dist) % self.nimages;
         const target_id = id - dist;
 
@@ -237,19 +240,19 @@ pub const GlibGlzDecoder = struct {
     image: GlzImageHdr,
     allocator: std.mem.Allocator,
 
-    fn decode32(self: *GlibGlzDecoder) u32 {
+    inline fn decode32(self: *GlibGlzDecoder) u32 {
         // Read as big endian (like spice-gtk decode_32 function)
         const word = std.mem.readInt(u32, self.in_now[0..4], .big);
         self.in_now += 4;
         return word;
     }
 
-    fn decode64(self: *GlibGlzDecoder) u64 {
+    inline fn decode64(self: *GlibGlzDecoder) u64 {
         const long_word = @as(u64, self.decode32()) << 32;
         return long_word | @as(u64, self.decode32());
     }
 
-    fn decodeHeader(self: *GlibGlzDecoder) !void {
+    inline fn decodeHeader(self: *GlibGlzDecoder) !void {
         const magic = self.decode32();
         if (magic != LZ_MAGIC) return error.InvalidMagic;
 
@@ -272,7 +275,7 @@ pub const GlibGlzDecoder = struct {
         self.image.win_head_dist = self.decode32();
     }
 
-    fn glzRgb32Decode(self: *GlibGlzDecoder, out_buf: [*]u8, size: u32, palette: ?*lz.SpicePalette) !usize {
+    inline fn glzRgb32Decode(self: *GlibGlzDecoder, out_buf: [*]u8, size: u32, palette: ?*lz.SpicePalette) !usize {
         _ = palette;
 
         var ip = self.in_now;
@@ -280,11 +283,96 @@ pub const GlibGlzDecoder = struct {
         var op: u32 = 0;
         const op_limit = size;
 
+        // Cache for dictionary lookups - reduces redundant window.bits() calls
+        var cached_image_dist: u32 = 0xFFFFFFFF; // Invalid value to force initial lookup
+        var cached_ref_bits: ?[*]u8 = null;
+
         var ctrl = ip[0];
         ip += 1;
 
         while (true) {
-            if (ctrl >= MAX_COPY) {
+            // Optimized control flow: literals first (more common case, better branch prediction)
+            if (ctrl < MAX_COPY) {
+                // Handle literal data (hot path)
+                const count = ctrl + 1;
+
+                // Hoist bounds checking outside loop
+                if (op + count > op_limit) {
+                    return error.OutputOverflow;
+                }
+
+                // Enhanced batch processing for better throughput
+                if (ENABLE_SIMD and count >= 16) {
+                    const out_bytes: [*]u8 = @ptrCast(out_pix_buf);
+                    const out_start_byte = op * 4;
+                    var remaining: u32 = count;
+                    var ip_offset: usize = 0;
+                    var out_offset: usize = out_start_byte;
+
+                    // Process 16 pixels per iteration for maximum throughput
+                    while (remaining >= 16) : (remaining -= 16) {
+                        comptime var i: usize = 0;
+                        inline while (i < 16) : (i += 1) {
+                            out_bytes[out_offset + i * 4 + 0] = ip[ip_offset + i * 3 + 0]; // B
+                            out_bytes[out_offset + i * 4 + 1] = ip[ip_offset + i * 3 + 1]; // G
+                            out_bytes[out_offset + i * 4 + 2] = ip[ip_offset + i * 3 + 2]; // R
+                            out_bytes[out_offset + i * 4 + 3] = 0; // A (always 0 for RGB32)
+                        }
+                        ip_offset += 48; // 16 pixels * 3 bytes
+                        out_offset += 64; // 16 pixels * 4 bytes
+                    }
+
+                    // Process 8 pixels per iteration for medium batches
+                    while (remaining >= 8) : (remaining -= 8) {
+                        comptime var i: usize = 0;
+                        inline while (i < 8) : (i += 1) {
+                            out_bytes[out_offset + i * 4 + 0] = ip[ip_offset + i * 3 + 0]; // B
+                            out_bytes[out_offset + i * 4 + 1] = ip[ip_offset + i * 3 + 1]; // G
+                            out_bytes[out_offset + i * 4 + 2] = ip[ip_offset + i * 3 + 2]; // R
+                            out_bytes[out_offset + i * 4 + 3] = 0; // A (always 0 for RGB32)
+                        }
+                        ip_offset += 24; // 8 pixels * 3 bytes
+                        out_offset += 32; // 8 pixels * 4 bytes
+                    }
+
+                    // Process 4 pixels per iteration for remaining
+                    while (remaining >= 4) : (remaining -= 4) {
+                        comptime var i: usize = 0;
+                        inline while (i < 4) : (i += 1) {
+                            out_bytes[out_offset + i * 4 + 0] = ip[ip_offset + i * 3 + 0]; // B
+                            out_bytes[out_offset + i * 4 + 1] = ip[ip_offset + i * 3 + 1]; // G
+                            out_bytes[out_offset + i * 4 + 2] = ip[ip_offset + i * 3 + 2]; // R
+                            out_bytes[out_offset + i * 4 + 3] = 0; // A
+                        }
+                        ip_offset += 12; // 4 pixels * 3 bytes
+                        out_offset += 16; // 4 pixels * 4 bytes
+                    }
+
+                    // Process remaining pixels
+                    for (0..remaining) |_| {
+                        out_bytes[out_offset + 0] = ip[ip_offset + 0]; // B
+                        out_bytes[out_offset + 1] = ip[ip_offset + 1]; // G
+                        out_bytes[out_offset + 2] = ip[ip_offset + 2]; // R
+                        out_bytes[out_offset + 3] = 0; // A
+                        ip_offset += 3;
+                        out_offset += 4;
+                    }
+
+                    ip += count * 3;
+                    op += count;
+                } else {
+                    // Fallback scalar path
+                    for (0..count) |_| {
+                        out_pix_buf[op].b = ip[0];
+                        out_pix_buf[op].g = ip[1];
+                        out_pix_buf[op].r = ip[2];
+                        out_pix_buf[op].pad = 0;
+                        ip += 3;
+                        op += 1;
+                    }
+                }
+            } else {
+                // Handle references (cold path)
                 var len = @as(u32, ctrl >> 5);
                 const pixel_flag = (ctrl >> 4) & 0x01;
                 var pixel_ofs = @as(u32, ctrl & 0x0f);
@@ -343,11 +431,26 @@ pub const GlibGlzDecoder = struct {
                     if (pixel_ofs > op) return error.CorruptedData;
                     ref = out_pix_buf + (op - pixel_ofs);
                 } else {
-                    const ref_bits = self.window.bits(self.image.id, image_dist, pixel_ofs);
+                    // Cache dictionary lookups to reduce window.bits() calls
+                    var ref_bits: ?[*]u8 = null;
+                    if (image_dist == cached_image_dist) {
+                        ref_bits = cached_ref_bits;
+                    } else {
+                        ref_bits = self.window.bits(self.image.id, image_dist, 0); // Base reference
+                        cached_image_dist = image_dist;
+                        cached_ref_bits = ref_bits;
+
+                        // Prefetch window data for better cache locality
+                        if (ref_bits) |bits| {
+                            @prefetch(bits, .{});
+                        }
+                    }
+
                     if (ref_bits == null) return error.ReferenceNotFound;
-                    ref = @ptrCast(@alignCast(ref_bits.?));
+                    ref = @ptrCast(@alignCast(ref_bits.? + pixel_ofs * 4));
                 }
 
+                // Hoist bounds checking outside loops
                 if (op + len > op_limit) {
                     return error.OutputOverflow;
                 }
@@ -355,39 +458,15 @@ pub const GlibGlzDecoder = struct {
                 if (ref == (out_pix_buf + op - 1)) {
                     const pixel = (out_pix_buf + op - 1)[0];
                     for (0..len) |_| {
-                        if (op >= op_limit) {
-                            return error.BufferOverrun;
-                        }
                         out_pix_buf[op] = pixel;
                         op += 1;
                     }
                 } else {
                     for (0..len) |_| {
-                        if (op >= op_limit) {
-                            return error.BufferOverrun;
-                        }
                         out_pix_buf[op] = ref[0];
                         ref += 1;
                         op += 1;
                     }
-                }
-            } else {
-                const count = ctrl + 1;
-
-                if (op + count > op_limit) {
-                    return error.OutputOverflow;
-                }
-
-                for (0..count) |_| {
-                    if (op >= op_limit) {
-                        return error.BufferOverrun;
-                    }
-                    out_pix_buf[op].b = ip[0];
-                    out_pix_buf[op].g = ip[1];
-                    out_pix_buf[op].r = ip[2];
-                    out_pix_buf[op].pad = 0;
-                    ip += 3;
-                    op += 1;
                 }
             }
 
@@ -402,7 +481,7 @@ pub const GlibGlzDecoder = struct {
         return @intFromPtr(ip) - @intFromPtr(self.in_now);
     }
 
-    fn glzRgbAlphaDecode(self: *GlibGlzDecoder, out_buf: [*]u8, size: u32, palette: ?*lz.SpicePalette) !usize {
+    inline fn glzRgbAlphaDecode(self: *GlibGlzDecoder, out_buf: [*]u8, size: u32, palette: ?*lz.SpicePalette) !usize {
         _ = palette;
 
         var ip = self.in_now;
@@ -410,11 +489,29 @@ pub const GlibGlzDecoder = struct {
         var op: u32 = 0;
         const op_limit = size;
 
+        // Cache for dictionary lookups - reduces redundant window.bits() calls
+        var cached_image_dist: u32 = 0xFFFFFFFF; // Invalid value to force initial lookup
+        var cached_ref_bits: ?[*]u8 = null;
+
         var ctrl = ip[0];
         ip += 1;
 
         while (true) {
-            if (ctrl >= MAX_COPY) {
+            // Optimized control flow: literals first (more common case, better branch prediction)
+            if (ctrl < MAX_COPY) {
+                // Handle literal data (hot path for alpha channel)
+                const count = ctrl + 1;
+
+                // Hoist bounds checking outside loop
+                if (op + count > op_limit) return error.OutputOverflow;
+
+                for (0..count) |_| {
+                    out_pix_buf[op].pad = ip[0];
+                    ip += 1;
+                    op += 1;
+                }
+            } else {
+                // Handle references (cold path)
                 var len = @as(u32, ctrl >> 5);
                 const pixel_flag = (ctrl >> 4) & 0x01;
                 var pixel_ofs = @as(u32, ctrl & 0x0f);
@@ -472,11 +569,26 @@ pub const GlibGlzDecoder = struct {
                     if (pixel_ofs > op) return error.CorruptedData;
                     ref = out_pix_buf + (op - pixel_ofs);
                 } else {
-                    const ref_bits = self.window.bits(self.image.id, image_dist, pixel_ofs);
+                    // Cache dictionary lookups to reduce window.bits() calls
+                    var ref_bits: ?[*]u8 = null;
+                    if (image_dist == cached_image_dist) {
+                        ref_bits = cached_ref_bits;
+                    } else {
+                        ref_bits = self.window.bits(self.image.id, image_dist, 0); // Base reference
+                        cached_image_dist = image_dist;
+                        cached_ref_bits = ref_bits;
+
+                        // Prefetch window data for better cache locality
+                        if (ref_bits) |bits| {
+                            @prefetch(bits, .{});
+                        }
+                    }
+
                     if (ref_bits == null) return error.ReferenceNotFound;
-                    ref = @ptrCast(@alignCast(ref_bits.?));
+                    ref = @ptrCast(@alignCast(ref_bits.? + pixel_ofs * 4));
                 }
 
+                // Hoist bounds checking outside loops
                 if (op + len > op_limit) return error.OutputOverflow;
 
                 if (ref == (out_pix_buf + op - 1)) {
@@ -491,16 +603,6 @@ pub const GlibGlzDecoder = struct {
                         ref += 1;
                         op += 1;
                     }
-                }
-            } else {
-                const count = ctrl + 1;
-
-                if (op + count > op_limit) return error.OutputOverflow;
-
-                for (0..count) |_| {
-                    out_pix_buf[op].pad = ip[0];
-                    ip += 1;
-                    op += 1;
                 }
             }
 

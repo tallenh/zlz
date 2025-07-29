@@ -10,6 +10,11 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const optimize = b.standardOptimizeOption(.{});
 
+    // Optional SIMD fast paths
+    const simd_option = b.option(bool, "simd", "Enable SIMD fast paths (default: true)") orelse true;
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "simd", simd_option);
+
     // Create a library target for the LZ and GLZ decoders
     const lib = b.addStaticLibrary(.{
         .name = "zlz",
@@ -21,12 +26,15 @@ pub fn build(b: *std.Build) void {
     const logger = b.dependency("logger", .{ .target = target, .optimize = optimize });
     const logger_mod = logger.module("logger");
     lib.root_module.addImport("logger", logger_mod);
+    lib.root_module.addOptions("build_options", build_opts);
 
     // Helper to inject the logger dependency into build steps that expose a
     // root_module field (executables, tests, etc.).
-    const addLoggerImport = struct {
-        fn apply(step: anytype, logger_mod_param: anytype) void {
-            @field(step, "root_module").addImport("logger", logger_mod_param);
+    const addImports = struct {
+        fn apply(step: anytype, logger_mod_param: anytype, build_opts_param: anytype) void {
+            const rm = @field(step, "root_module");
+            rm.addImport("logger", logger_mod_param);
+            rm.addOptions("build_options", build_opts_param);
         }
     };
 
@@ -131,6 +139,33 @@ pub fn build(b: *std.Build) void {
     const test_lz_step = b.step("test-lz", "Run LZ/GLZ decoder tests");
     test_lz_step.dependOn(&run_lib_unit_tests.step);
 
+    // Regression test comparing against C reference decoder
+    const lz_reg_unit_tests = b.addTest(.{
+        .root_source_file = b.path("src/test_lz_regression.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    
+    // Add C source file
+    lz_reg_unit_tests.addCSourceFile(.{
+        .file = b.path("c_ref/lz_wrapper.c"),
+        .flags = &.{"-std=c99"},
+    });
+    
+    // Add include paths for C reference headers
+    lz_reg_unit_tests.root_module.addIncludePath(b.path("c_ref"));
+    lz_reg_unit_tests.root_module.addIncludePath(b.path("ref/spice-common/common"));
+    lz_reg_unit_tests.root_module.addIncludePath(b.path("ref/spice-protocol"));
+    lz_reg_unit_tests.root_module.addIncludePath(b.path("ref/spice-protocol/spice"));
+    addImports.apply(lz_reg_unit_tests, logger_mod, build_opts);
+    
+    // Link C standard library
+    lz_reg_unit_tests.linkLibC();
+    
+    const run_lz_reg_unit_tests = b.addRunArtifact(lz_reg_unit_tests);
+    test_step.dependOn(&run_lz_reg_unit_tests.step);
+    test_lz_step.dependOn(&run_lz_reg_unit_tests.step);
+
     const test_root_step = b.step("test-root", "Run root library API tests");
     test_root_step.dependOn(&run_root_unit_tests.step);
 
@@ -141,21 +176,22 @@ pub fn build(b: *std.Build) void {
     test_zlib_step.dependOn(&run_zlib_unit_tests.step);
 
     // Executable demo
-    addLoggerImport.apply(exe, logger_mod);
+    addImports.apply(exe, logger_mod, build_opts);
 
     // Test executables
-    addLoggerImport.apply(test_exe, logger_mod);
+    addImports.apply(test_exe, logger_mod, build_opts);
 
-    addLoggerImport.apply(lib_unit_tests, logger_mod);
-    addLoggerImport.apply(root_unit_tests, logger_mod);
-    addLoggerImport.apply(lz4_unit_tests, logger_mod);
-    addLoggerImport.apply(zlib_unit_tests, logger_mod);
+    addImports.apply(lib_unit_tests, logger_mod, build_opts);
+    addImports.apply(root_unit_tests, logger_mod, build_opts);
+    addImports.apply(lz4_unit_tests, logger_mod, build_opts);
+    addImports.apply(zlib_unit_tests, logger_mod, build_opts);
 
     // Root module that other projects import.
     const zlz_module = b.addModule("zlz", .{
         .root_source_file = b.path("src/root.zig"),
     });
     zlz_module.addImport("logger", logger_mod);
+    zlz_module.addOptions("build_options", build_opts);
 
     // If more steps are added later that need logger, remember to call
     // addLoggerImport.apply on them.
